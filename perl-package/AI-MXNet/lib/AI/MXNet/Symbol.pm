@@ -1,4 +1,10 @@
 package AI::MXNet::Symbol;
+
+=head1 NAME
+
+AI::MXNet::Symbol - Symbolic interface of MXNet.
+=cut
+
 use strict;
 use warnings;
 use AI::MXNet::Base;
@@ -20,7 +26,8 @@ use overload
     '>='  => \&greater_equal,
     '<'   => \&lesser,
     '<='  => \&lesser_equal,
-    '&{}' => sub { my $self = shift; sub { $self->call(@_) } };
+    '&{}' => sub { my $self = shift; sub { $self->call(@_) } },
+    '@{}' => sub { my $self = shift; [map { $self->slice($_) } @{ $self->list_outputs }] };
 
 extends 'AI::MXNet::Symbol::Base';
 has 'handle'   => (is => 'rw', isa => 'SymbolHandle', required => 1);
@@ -195,95 +202,51 @@ method deepcopy()
     return __PACKAGE__->new(handle => $handle);
 }
 
-=head2 call
-        Invoke symbol as function on inputs.
-
-        Parameters
-        ----------
-        args:
-            provide positional arguments
-
-        kwargs:
-            provide keyword arguments
-        Returns
-        -------
-        the resulting symbol
-=cut
-
-method call(ArrayRef $args, HashRef $kwargs)
+method call(@args)
 {
     my $s = $self->deepcopy();
-    $s->_compose(@$args, $kwargs);
+    $s->_compose(@args);
     return $s;
 }
 
-method slice(ArrayRef|HashRef|Str|Index @args)
+method slice(Str|Index $index)
 {
-    confess("No arguments supplied") unless @args;
     ## __getitem__ tie needs to die
-    if(not grep { ref } @args)
+    if(not find_type_constraint('Index')->check($index))
     {
-        confess("can only get one item from the symbol")
-            if @args > 1;
-        my $index = $args[0];
-        if(not find_type_constraint('Index')->check($index))
+        my $i = 0;
+        my $idx;
+        for my $name (@{ $self->list_outputs() })
         {
-            my $i = 0;
-            my $idx;
-            for my $name (@{ $self->list_outputs() })
+            if($name eq $index)
             {
-                if($name eq $index)
+                if(defined $idx)
                 {
-                    if(defined $idx)
-                    {
-                        confess(qq/There are multiple outputs with name "$index"/);
-                    }
-                    $idx = $i;
+                    confess(qq/There are multiple outputs with name "$index"/);
                 }
-                $i++;
+                $idx = $i;
             }
-            confess(qq/Cannot find output that matches name "$index"/) unless defined $idx;
-            $index = $idx;
+            $i++;
         }
-        my $handle = check_call(AI::MXNetCAPI::SymbolGetOutput($self->handle, $index));
-        return __PACKAGE__->new(handle => $handle);
+        confess(qq/Cannot find output that matches name "$index"/) unless defined $idx;
+        $index = $idx;
     }
-    else
+    elsif($index >= @{ $self->list_outputs() })
     {
-        confess("call expects no more than two arguments that must be either hash or array refs")
-            unless(@args > 2 or grep { not ref } @args);
-        my @call_args;
-        if(@args == 1)
-        {
-            if(ref($args[0]) eq 'HASH')
-            {
-                @call_args = ([], $args[0]);
-            }
-            else
-            {
-                @call_args = ($args[0], {});
-            }
-        }
-        else
-        {
-            my @hash = grep { ref($_) eq 'HASH' } @args;
-            my @array = grep { ref($_) eq 'ARRAY' } @args;
-            confess("call expects no more than one hash ref and no more than one array ref")
-                unless(@hash == 1 and @array == 1);
-            @call_args = ($array[0], $hash[0]);
-        }
-        return &{$self}(@call_args);
+        confess("Index: [$index] is outside of the range of the symbol: $self outputs");
     }
+    my $handle = check_call(AI::MXNetCAPI::SymbolGetOutput($self->handle, $index));
+    return __PACKAGE__->new(handle => $handle);
 }
 
 =head2 name
 
-        Get name string from the symbol, this function only works for non-grouped symbol.
+Get name string from the symbol, this function only works for non-grouped symbol.
 
-        Returns
-        -------
-        value : str
-            The name of this symbol, returns None for grouped symbol.
+Returns
+-------
+value : str
+    The name of this symbol, returns None for grouped symbol.
 =cut
 
 method name()
@@ -294,17 +257,17 @@ method name()
 
 =head2 attr
 
-        Get attribute string from the symbol, this function only works for non-grouped symbol.
+Get an attribute string from the symbol, this function only works for non-grouped symbol.
 
-        Parameters
-        ----------
-        key : str
-            The key to get attribute from.
+Parameters
+----------
+key : str
+    The key to get attribute from.
 
-        Returns
-        -------
-        value : str
-            The attribute value of the key, returns None if attribute do not exist.
+Returns
+-------
+value : str
+    The attribute value of the key, returns None if attribute do not exist.
 =cut
 
 
@@ -318,12 +281,12 @@ method attr(Str $key)
 
 =head2 list_attr
 
-        Get all attributes from the symbol.
+Get all attributes from the symbol.
 
-        Returns
-        -------
-        ret : dict of str to str
-            a dicitonary mapping attribute keys to values
+Returns
+-------
+ret : hash ref of str to str
+    a dicitonary mapping attribute keys to values
 =cut
 
 method list_attr()
@@ -332,27 +295,29 @@ method list_attr()
     my @attrs = @{ check_call(AI::MXNetCAPI::SymbolListAttrShallow($self->handle)) };
     while(@attrs)
     {
-        $ret{ shift(@attrs) } = shift(@attrs);
+        my $k = shift(@attrs);
+        my $v = shift(@attrs);
+        $ret{ $k } = $v;
     }
     return \%ret;
 }
 
 =head2 attr_dict
 
-        Recursively get all attributes from the symbol and its childrens
+Recursively get all attributes from the symbol and its childrens
 
-        Returns
-        -------
-        ret : dict of str to dict
-            Returns a dict whose keys are names of the symbol and its children.
-            Values of the returned dict are dictionaries that map attribute keys to values
+Returns
+-------
+ret : hash ref of str to hash ref.
+    Returns a dict whose keys are names of the symbol and its children.
+    Values of the returned dict are dictionaries that map attribute keys to values.
 =cut
 
 method attr_dict()
 {
     my %ret;
     my @attrs = @{ check_call(AI::MXNetCAPI::SymbolListAttr($self->handle)) };
-    my $size = @attrs/2; 
+    my $size = @attrs/2;
     for (my $i = 0; $i < $size; $i++)
     {
         my ($name, $key) = split(/\$/, $attrs[$i*2]);
@@ -376,12 +341,13 @@ method _set_attr(Str @args)
 }
 
 =head2 get_internals
-        Get a new grouped symbol whose output contains all the internal outputs of this symbol.
 
-        Returns
-        -------
-        sgroup : Symbol
-            The internal of the symbol.
+Get a new grouped symbol whose output contains all the internal outputs of this symbol.
+
+Returns
+-------
+    sgroup : AI::MXNet::Symbol
+    The internal symbol of the symbol.
 =cut
 
 method get_internals()
@@ -390,14 +356,34 @@ method get_internals()
     return __PACKAGE__->new(handle => $handle);
 }
 
+=head2 get_children
+
+Get a new grouped symbol whose output contains
+inputs to output nodes of the original symbol
+
+Returns
+-------
+sgroup : Symbol or undef
+    The children of the head node. If the symbol has no
+    inputs undef will be returned.
+=cut
+
+
+method get_children()
+{
+    my $handle = check_call(AI::MXNetCAPI::SymbolGetChildren($self->handle));
+    my $ret = __PACKAGE__->new(handle => $handle);
+    return undef unless @{ $ret->list_outputs };
+    return $ret;
+}
+
 =head2 list_arguments
 
-        List all the arguments in the symbol.
+List all the arguments in the symbol.
 
-        Returns
-        -------
-        args : list of string
-            List of all the arguments.
+Returns
+-------
+args : array ref of strings
 =cut
 
 method list_arguments()
@@ -407,12 +393,11 @@ method list_arguments()
 
 =head2 list_outputs()
 
-        List all outputs in the symbol.
+List all outputs in the symbol.
 
-        Returns
-        -------
-        returns : list of string
-            List of all the outputs.
+Returns
+-------
+$out : array ref of strings.
 =cut
 
 method list_outputs()
@@ -423,19 +408,19 @@ method list_outputs()
 
 =head2 list_auxiliary_states()
 
-        List all auxiliary states in the symbol.
+List all auxiliary states in the symbol.
 
-        Returns
-        -------
-        aux_states : list of string
-            List the names of the auxiliary states.
+Returns
+-------
+aux_states : array ref of string
+    List the names of the auxiliary states.
 
-        Notes
-        -----
-        Auxiliary states are special states of symbols that do not corresponds to an argument,
-        and do not have gradient. But still be useful for the specific operations.
-        A common example of auxiliary state is the moving_mean and moving_variance in BatchNorm.
-        Most operators do not have Auxiliary states.
+    Notes
+    -----
+    Auxiliary states are special states of symbols that do not corresponds to an argument,
+    and do not have gradient. But still be useful for the specific operations.
+    A common example of auxiliary state is the moving_mean and moving_variance in BatchNorm.
+    Most operators do not have Auxiliary states.
 =cut
 
 method list_auxiliary_states()
@@ -463,13 +448,13 @@ method list_auxiliary_states()
 
         Returns
         -------
-        arg_types : list of numpy.dtype or None
+        arg_types : array ref of Dtype or undef
             List of types of arguments.
             The order is in the same order as list_arguments()
-        out_types : list of numpy.dtype or None
+        out_types : array ref of Dtype or undef
             List of types of outputs.
             The order is in the same order as list_outputs()
-        aux_types : list of numpy.dtype or None
+        aux_types : array ref of Dtype or undef
             List of types of outputs.
             The order is in the same order as list_auxiliary()
 =cut
@@ -522,33 +507,62 @@ method infer_type(Str|Undef @args)
         ----------
         *args :
             Provide shape of arguments in a positional way.
-            Unknown shape can be marked as None
+            Unknown shape can be marked as undef
 
         **kwargs :
             Provide keyword arguments of known shapes.
 
         Returns
         -------
-        arg_shapes : list of tuple or None
+        arg_shapes : array ref of Shape or undef
             List of shapes of arguments.
             The order is in the same order as list_arguments()
-        out_shapes : list of tuple or None
+        out_shapes : array ref of Shape or undef
             List of shapes of outputs.
             The order is in the same order as list_outputs()
-        aux_shapes : list of tuple or None
+        aux_shapes : array ref of Shape or undef
             List of shapes of outputs.
             The order is in the same order as list_auxiliary()
 =cut
 
 method infer_shape(Maybe[Str|Shape] @args)
 {
-    $self->_infer_shape_impl(0, @args)
+    my @res = $self->_infer_shape_impl(0, @args);
+    if(not defined $res[1])
+    {
+        my ($arg_shapes) = $self->_infer_shape_impl(1, @args);
+        my $arg_names    = $self->list_arguments;
+        my @unknowns;
+        zip(sub {
+            my ($name, $shape) = @_;
+            if(not ref $shape or not @$shape or not product(@$shape))
+            {
+                if(@unknowns >= 10)
+                {
+                    $unknowns[10] = '...';
+                }
+                else
+                {
+                    my @shape = eval { @$shape };
+                    push @unknowns, "$name @shape";
+                }
+            }
+        }, $arg_names, $arg_shapes);
+        AI::MXNet::Logging->warning(
+            "Cannot decide shape for the following arguments "
+            ."(0s in shape means unknown dimensions). "
+            ."Consider providing them as input:\n\t"
+            ."\n\t"
+            .join(", ", @unknowns)
+        );
+    }
+    return @res;
 }
 
 =head2 infer_shape_partial
 
-        Partially infer the shape. The same as infer_shape, except that the partial
-        results can be returned.
+Partially infer the shape. The same as infer_shape, except that the partial
+results can be returned.
 =cut
 
 method infer_shape_partial(Maybe[Str|Shape] @args)
@@ -602,12 +616,12 @@ method _infer_shape_impl(Maybe[Str|Shape] @args)
 
 =head2 debug_str
 
-        Get a debug string.
+The debug string.
 
-        Returns
-        -------
-        debug_str : string
-            Debug string of the symbol.
+Returns
+-------
+debug_str : string
+    Debug string of the symbol.
 =cut
 
 method debug_str()
@@ -617,7 +631,7 @@ method debug_str()
 
 =head2 save
 
-        Save symbol into file.
+        Save the symbol into a file.
 
         You can also use Storable to do the job if you only work on Perl.
         The advantage of load/save is the file is language agnostic.
@@ -644,7 +658,7 @@ method save(Str $fname)
 
 =head2 tojson
 
-        Save symbol into a JSON string.
+        Save the symbol into a JSON string.
 
         See Also
         --------
@@ -655,36 +669,6 @@ method tojson()
 {
     return scalar(check_call(AI::MXNetCAPI::SymbolSaveToJSON($self->handle)));
 }
-
-
-=head2 _get_ndarray_inputs
-
-        Helper function to get ndarray lists handles from various inputs.
-
-        Parameters
-        ----------
-        arg_key : str
-            The name of argument, used for error message.
-
-        args : list of NDArray or dict of str to NDArray
-            Input arguments to the symbols.
-            If type is list of NDArray, the position is in the same order of arg_names.
-            If type is dict of str to NDArray, then it maps the name of arguments
-            to the corresponding NDArray,
-
-        args_names : list of string
-            List of argument names.
-
-        allow_missing : boolean
-            Whether missing argument is allowed.
-            When allowed, the missing handle will be set to None(null)
-
-        Returns
-        -------
-        handles : list of NDArrayHandle
-            The positional list of NDArrayHandles generated from input.
-=cut
-
 
 method _get_ndarray_inputs(
     Str                                                      $arg_key,
@@ -720,52 +704,60 @@ method _get_ndarray_inputs(
 
 =head2 simple_bind
 
-        Bind current symbol to get an executor, allocate all the ndarrays needed.
-        Allows specifying data types.
+Bind current symbol to get an executor, allocate all the ndarrays needed.
+Allows specifying data types.
 
-        This function will ask user to pass in ndarray of position
-        they like to bind to, and it will automatically allocate the ndarray
-        for arguments and auxiliary states that user did not specify explicitly.
+This function will ask user to pass in ndarray of position
+they like to bind to, and it will automatically allocate the ndarray
+for arguments and auxiliary states that user did not specify explicitly.
 
-        Parameters
-        ----------
-        ctx : Context
-            The device context the generated executor to run on.
+Parameters
+----------
+:$ctx : AI::MXNet::Context
+    The device context the generated executor to run on.
 
-        grad_req: string
-            {'write', 'add', 'null'}, or list of str or dict of str to str, optional
-            Specifies how we should update the gradient to the args_grad.
-            - 'write' means everytime gradient is write to specified args_grad NDArray.
-            - 'add' means everytime gradient is add to the specified NDArray.
-            - 'null' means no action is taken, the gradient may not be calculated.
+:$grad_req: string
+    {'write', 'add', 'null'}, or list of str or dict of str to str, optional
+    Specifies how we should update the gradient to the args_grad.
+    - 'write' means everytime gradient is write to specified args_grad NDArray.
+    - 'add' means everytime gradient is add to the specified NDArray.
+    - 'null' means no action is taken, the gradient may not be calculated.
 
-        type_dict  : dict of str->numpy.dtype
-            Input type dictionary, name->dtype
+:$type_dict  : hash ref of str->Dtype
+    Input type map, name->dtype
 
-        group2ctx : dict of string to mx.Context
-            The dict mapping the ``ctx_group`` attribute to the context assignment.
+:$group2ctx : hash ref of string to AI::MXNet::Context
+    The mapping of the ctx_group attribute to the context assignment.
 
-        kwargs : dict of str->shape
-            Input shape dictionary, name->shape
+:$shapes : hash ref of str->Shape
+    Input shape map, name->shape
 
-        Returns
-        -------
-        executor : mxnet.Executor
-            The generated Executor
+Returns
+-------
+$executor : AI::MXNet::Executor
+    The generated Executor
 =cut
 
 method simple_bind(
             AI::MXNet::Context                 :$ctx=AI::MXNet::Context->current_ctx,
-            HashRef[Shape]                     :$shapes,
+            Maybe[HashRef[Shape]]              :$shapes=,
             Str|HashRef[Str]                   :$grad_req='write',
             Maybe[HashRef[Dtype]]              :$type_dict=,
             Maybe[HashRef[AI::MXNet::Context]] :$group2ctx=
 )
 {
+    $shapes //= {};
     if(not defined $type_dict)
     {
         $type_dict =  {};
-        %$type_dict = map { $_ => 'float32' } @{ $self->list_arguments };
+        my $attrs = $self->attr_dict;
+        for my $k (@{ $self->list_arguments })
+        {
+            if(not exists $attrs->{$k} or not exists $attrs->{$k}{__dtype__})
+            {
+                $type_dict->{ $k } = 'float32';
+            }
+        }
     }
     my @keys = keys %$shapes;
     my @shape_input;
@@ -780,7 +772,7 @@ method simple_bind(
     confess("Input node is not complete") 
         unless $arg_shapes and $arg_types;
 
-    my ($arg_ctx, $aux_ctx) = ([], []); 
+    my ($arg_ctx, $aux_ctx) = ([], []);
     if(defined $group2ctx)
     {
         my $attr_dict = $self->attr_dict();
@@ -861,77 +853,73 @@ method simple_bind(
 
 =head2 bind
 
-        Bind current symbol to get an executor.
+Bind current symbol to get an executor.
 
-        Parameters
-        ----------
-        ctx : Context
-            The device context the generated executor to run on.
+Parameters
+----------
+:$ctx : AI::MXNet::Context
+    The device context the generated executor to run on.
 
-        args : list of NDArray or dict of str to NDArray
-            Input arguments to the symbol.
+:$args : HashRef[AI::MXNet::NDArray]|ArrayRef[AI::MXNet::NDArray]
+    Input arguments to the symbol.
+    - If type is array ref of NDArray, the position is in the same order of list_arguments.
+    - If type is hash ref of str to NDArray, then it maps the name of arguments
+    to the corresponding NDArray.
+    - In either case, all the arguments must be provided.
 
-            - If type is list of NDArray, the position is in the same order of list_arguments.
-            - If type is dict of str to NDArray, then it maps the name of arguments
-              to the corresponding NDArray.
-            - In either case, all the arguments must be provided.
+:$args_grad : Maybe[HashRef[AI::MXNet::NDArray]|ArrayRef[AI::MXNet::NDArray]]
+    When specified, args_grad provide NDArrays to hold
+    the result of gradient value in backward.
+    - If type is array ref of NDArray, the position is in the same order of list_arguments.
+    - If type is hash ref of str to NDArray, then it maps the name of arguments
+    to the corresponding NDArray.
+    - When the type is hash ref of str to NDArray, users only need to provide the dict
+    for needed argument gradient.
+    Only the specified argument gradient will be calculated.
 
-        args_grad : list of NDArray or dict of str to NDArray, optional
-            When specified, args_grad provide NDArrays to hold
-            the result of gradient value in backward.
+:$grad_req : {'write', 'add', 'null'}, or array ref of str or hash ref of str to str, optional
+    Specifies how we should update the gradient to the args_grad.
+    - 'write' means everytime gradient is write to specified args_grad NDArray.
+    - 'add' means everytime gradient is add to the specified NDArray.
+    - 'null' means no action is taken, the gradient may not be calculated.
 
-            - If type is list of NDArray, the position is in the same order of list_arguments.
-            - If type is dict of str to NDArray, then it maps the name of arguments
-              to the corresponding NDArray.
-            - When the type is dict of str to NDArray, users only need to provide the dict
-              for needed argument gradient.
-              Only the specified argument gradient will be calculated.
+:$aux_states : array ref of NDArray, or hash ref of str to NDArray, optional
+    Input auxiliary states to the symbol, only need to specify when
+    list_auxiliary_states is not empty.
+    - If type is array ref of NDArray, the position is in the same order of list_auxiliary_states
+    - If type is hash ref of str to NDArray, then it maps the name of auxiliary_states
+    to the corresponding NDArray,
+    - In either case, all the auxiliary_states need to be provided.
 
-        grad_req : {'write', 'add', 'null'}, or list of str or dict of str to str, optional
-            Specifies how we should update the gradient to the args_grad.
+:$group2ctx : hash ref of string to AI::MXNet::Context
+    The mapping of the ctx_group attribute to the context assignment.
 
-            - 'write' means everytime gradient is write to specified args_grad NDArray.
-            - 'add' means everytime gradient is add to the specified NDArray.
-            - 'null' means no action is taken, the gradient may not be calculated.
+:$shared_exec : AI::MXNet::Executor
+    Executor to share memory with. This is intended for runtime reshaping, variable length
+    sequences, etc. The returned executor shares state with shared_exec, and should not be
+    used in parallel with it.
 
-        aux_states : list of NDArray, or dict of str to NDArray, optional
-            Input auxiliary states to the symbol, only need to specify when
-            list_auxiliary_states is not empty.
+Returns
+-------
+$executor : AI::MXNet::Executor
+    The generated Executor
 
-            - If type is list of NDArray, the position is in the same order of list_auxiliary_states
-            - If type is dict of str to NDArray, then it maps the name of auxiliary_states
-              to the corresponding NDArray,
-            - In either case, all the auxiliary_states need to be provided.
+Notes
+-----
+Auxiliary states are special states of symbols that do not corresponds to an argument,
+and do not have gradient. But still be useful for the specific operations.
+A common example of auxiliary state is the moving_mean and moving_variance in BatchNorm.
+Most operators do not have auxiliary states and this parameter can be safely ignored.
 
-        group2ctx : dict of string to mx.Context
-            The dict mapping the ``ctx_group`` attribute to the context assignment.
-
-        shared_exec : mx.executor.Executor
-            Executor to share memory with. This is intended for runtime reshaping, variable length
-            sequences, etc. The returned executor shares state with shared_exec, and should not be
-            used in parallel with it.
-
-        Returns
-        -------
-        executor : Executor
-            The generated Executor
-
-        Notes
-        -----
-        Auxiliary states are special states of symbols that do not corresponds to an argument,
-        and do not have gradient. But still be useful for the specific operations.
-        A common example of auxiliary state is the moving_mean and moving_variance in BatchNorm.
-        Most operators do not have auxiliary states and this parameter can be safely ignored.
-
-        User can give up gradient by using a dict in args_grad and only specify
-        gradient they interested in.
+User can give up gradient by using a hash ref in args_grad and only specify
+the gradient they're interested in.
 =cut
 
 method bind(
         AI::MXNet::Context                                              :$ctx,
         HashRef[AI::MXNet::NDArray]|ArrayRef[AI::MXNet::NDArray]        :$args,
         Maybe[HashRef[AI::MXNet::NDArray]|ArrayRef[AI::MXNet::NDArray]] :$args_grad=,
-        Str|HashRef[Str]|ArrayRef[Str]                                  :$grad_req=,
+        Str|HashRef[Str]|ArrayRef[Str]                                  :$grad_req='write',
         Maybe[HashRef[AI::MXNet::NDArray]|ArrayRef[AI::MXNet::NDArray]] :$aux_states=,
         Maybe[HashRef[AI::MXNet::Context]]                              :$group2ctx=,
         Maybe[AI::MXNet::Executor]                                      :$shared_exec=
@@ -994,7 +982,7 @@ method bind(
 
     if(defined $group2ctx)
     {
-        for (my ($key, $val) = each %{ $group2ctx })
+        while(my ($key, $val) = each %{ $group2ctx })
         {
             push @{ $ctx_map_keys } , $key;
             push @{ $ctx_map_dev_types }, $val->device_type_id;
@@ -1002,7 +990,6 @@ method bind(
         }
     }
     my $shared_handle = $shared_exec->handle if $shared_exec;
-#map { print AI::MXNet::NDArray->new(handle => $_)->aspdl, "\n"; } @{$args_handle};
     my $handle = check_call(AI::MXNetCAPI::ExecutorBindEX(
                 $self->handle,
                 $ctx->device_type_id,
@@ -1033,20 +1020,62 @@ method bind(
     return $executor;
 }
 
+=head2 eval
+
+Evaluate a symbol given arguments
+
+The `eval` method combines a call to `bind` (which returns an executor)
+with a call to `forward` (executor method).
+For the common use case, where you might repeatedly evaluate with same arguments,
+eval is slow.
+In that case, you should call `bind` once and then repeatedly call forward.
+Eval allows simpler syntax for less cumbersome introspection.
+
+Parameters
+----------
+:$ctx : Context
+The device context the generated executor to run on.
+Optional, defaults to cpu(0)
+
+:$args array ref of NDArray or hash ref of NDArray
+
+- If the type is an array ref of NDArray, the position is in the same order of list_arguments.
+- If the type is a hash of str to NDArray, then it maps the name of the argument
+  to the corresponding NDArray.
+- In either case, all arguments must be provided.
+
+Returns
+----------
+result :  an array ref of NDArrays corresponding to the values
+taken by each symbol when evaluated on given args.
+When called on a single symbol (not a group),
+the result will be an array ref with one element.
+
+Examples:
+my $result = $symbol->(ctx => mx->gpu, args => {data => mx->nd->ones([5,5])});
+my $result = $symbol->(args => {data => mx->nd->ones([5,5])});
+
+=cut
+
+method eval(:$ctx=AI::MXNet::Context->cpu, HashRef[AI::MXNet::NDArray]|ArrayRef[AI::MXNet::NDArray] :$args)
+{
+    return $self->bind(ctx => $ctx, args => $args)->forward;
+}
+
 =head2  grad
-        Get the autodiff of current symbol.
 
-        This function can only be used if current symbol is a loss function.
+Get the autodiff of current symbol.
+This function can only be used if current symbol is a loss function.
 
-        Parameters
-        ----------
-        wrt : Array of String
-            keyword arguments of the symbol that the gradients are taken.
+Parameters
+----------
+$wrt : Array of String
+    keyword arguments of the symbol that the gradients are taken.
 
-        Returns
-        -------
-        grad : Symbol
-            A gradient Symbol with returns to be the corresponding gradients.
+Returns
+-------
+grad : AI::MXNet::Symbol
+    A gradient Symbol with returns to be the corresponding gradients.
 =cut
 
 method grad(ArrayRef[Str] $wrt)
@@ -1060,7 +1089,7 @@ method grad(ArrayRef[Str] $wrt)
     return __PACKAGE__->new(handle => $handle);
 }
 
-=head2 Variable(name, attr=None, shape=None, lr_mult=None, wd_mult=None, dtype=None):
+=head2 Variable
 
     Create a symbolic variable with specified name.
 
@@ -1080,14 +1109,23 @@ method grad(ArrayRef[Str] $wrt)
         Specify weight decay muliplier for this variable.
     dtype : Dtype
         Similar to shape, we can specify dtype for this variable.
-
+    init : initializer (mx->init->*)
+        Specify initializer for this variable to override the default initializer
     Returns
     -------
     variable : Symbol
         The created variable symbol.
 =cut
 
-method Variable(Str $name, HashRef[Str] :$attr={}, Shape|Undef :$shape=, Num|Undef :$lr_mult=, Num|Undef :$wd_mult=, Dtype|Undef :$dtype=)
+method Variable(
+    Str                            $name,
+    HashRef[Str]                  :$attr={},
+    Maybe[Shape]                  :$shape=,
+    Maybe[Num]                    :$lr_mult=,
+    Maybe[Num]                    :$wd_mult=,
+    Maybe[Dtype]                  :$dtype=,
+    Maybe[AI::MXNet::Initializer] :$init=
+)
 {
     my $handle = check_call(AI::MXNetCAPI::SymbolCreateVariable($name));
     my $ret = __PACKAGE__->new(handle => $handle);
@@ -1096,6 +1134,7 @@ method Variable(Str $name, HashRef[Str] :$attr={}, Shape|Undef :$shape=, Num|Und
     $attr->{__lr_mult__} =  $lr_mult if defined $lr_mult;
     $attr->{__wd_mult__} =  $wd_mult if defined $wd_mult;
     $attr->{__dtype__}   = DTYPE_STR_TO_MX->{ $dtype } if $dtype;
+    $attr->{__init__}    = "$init" if defined $init;
     $ret->_set_attr(%{ $attr });
     return $ret;
 }
@@ -1117,7 +1156,8 @@ method Variable(Str $name, HashRef[Str] :$attr={}, Shape|Undef :$shape=, Num|Und
 
 method Group(ArrayRef[AI::MXNet::Symbol] $symbols)
 {
-    my $handle = check_call(AI::MXNetCAPI::SymbolCreateGroup($symbols));
+    my @handles = map { $_->handle } @{ $symbols };
+    my $handle = check_call(AI::MXNetCAPI::SymbolCreateGroup(scalar(@handles), \@handles));
     return __PACKAGE__->new(handle => $handle);
 }
 
@@ -1125,7 +1165,7 @@ method Group(ArrayRef[AI::MXNet::Symbol] $symbols)
 
     Load symbol from a JSON file.
 
-    You can also use pickle to do the job if you only work on python.
+    You can also use Storable to do the job if you only work with Perl.
     The advantage of load/save is the file is language agnostic.
     This means the file saved using save can be loaded by other language binding of mxnet.
     You also get the benefit being able to directly load/save from cloud storage(S3, HDFS)
@@ -1179,46 +1219,12 @@ method load_json(Str $json)
     return __PACKAGE__->new(handle => $handle);
 }
 
-=head2 zeros
-
-    Create a Tensor filled with zeros, similar to PDL::zeros
-
-    Parameters
-    ----------
-    shape :  int or sequence of ints
-        Shape of the new array.
-    dtype : type, optional
-        The value type of the NDArray, default to 'float32'
-
-    Returns
-    -------
-    out : Symbol
-        The created Symbol
-=cut
-
-method zeros(Shape $shape, Dtype :$dtype='float32', Str :$name)
+method zeros(Shape :$shape, Dtype :$dtype='float32', Str :$name)
 {
     return __PACKAGE__->_zeros({ shape => $shape, dtype => $dtype, name => $name });
 }
 
-=head2 ones
-
-    Create a Tensor filled with ones, similar to PDL::ones
-
-    Parameters
-    ----------
-    shape :  int or sequence of ints
-        Shape of the new array.
-    dtype : type, optional
-        The value type of the NDArray, default to 'float32'
-
-    Returns
-    -------
-    out : Symbol
-        The created Symbol
-=cut
-
-method ones(Shape $shape, Dtype :$dtype='float32', Str :$name)
+method ones(Shape :$shape, Dtype :$dtype='float32', Str :$name)
 {
     return __PACKAGE__->_ones({ shape => $shape, dtype => $dtype, name => $name });
 }

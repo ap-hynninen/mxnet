@@ -6,6 +6,11 @@ use List::Util qw(sum min);
 use AI::MXNet::Base;
 use AI::MXNet::Function::Parameters;
 
+=head1 NAME
+
+AI::MXNet::Executor::Group - Manager for a group of executors working in different contexts.
+=cut
+
 func _split_input_slice($batch_size, $work_load_list)
 {
     my $total_work_load = sum(@{ $work_load_list });
@@ -31,8 +36,7 @@ func _split_input_slice($batch_size, $work_load_list)
     }
     return \@slices;
 }
-
-# Load a list of arrays into a list of arrays specified by slices"""
+# Load a array ref of arrays into a array ref of arrays specified by slices
 func _load_general($data, $targets, $major_axis)
 {
     zip(sub {
@@ -40,6 +44,13 @@ func _load_general($data, $targets, $major_axis)
         if(blessed($d_targets) and $d_targets->isa('AI::MXNet::NDarray'))
         {
             $d_src->copyto($d_targets);
+        }
+        elsif(ref $d_targets eq 'ARRAY' and blessed $d_targets->[0])
+        {
+            zip(sub {
+                my ($src, $dst) = @_;
+                $src->copyto($dst);
+            }, $d_src, $d_targets);
         }
         else
         {
@@ -94,7 +105,15 @@ func _merge_multi_context($outputs, $major_axis)
         my ($tensors, $axis) = @_;
         if($axis >= 0)
         {
-            push @rets, AI::MXNet::NDArray->concatenate($tensors, axis => $axis, always_copy => 0);
+            if(@$tensors == 1)
+            {
+                push @rets, $tensors->[0];
+            }
+            else
+            {
+                my $ctx = $tensors->[0]->context;
+                push @rets, AI::MXNet::NDArray->concat((map { $_->as_in_context($ctx) } @$tensors), { dim => $axis });
+            }
         }
         else
         {
@@ -116,7 +135,8 @@ use Mouse;
 has [qw/output_layouts label_layouts arg_names aux_names
         batch_size slices execs data_arrays
         label_arrays param_arrays grad_arrays aux_arrays
-        data_layouts shared_data_arrays/
+        data_layouts shared_data_arrays input_grad_arrays
+        _default_execs state_arrays/
     ] => (is => 'rw', init_arg => undef);
 
 package AI::MXNet::DataParallelExecutorGroup;
@@ -132,45 +152,43 @@ use List::Util qw(sum);
 
     Parameters for constructor
     ----------
-    symbol : Symbol
+    symbol : AI::MXNet::Symbol
         The common symbolic computation graph for all executors.
-    contexts : list
-        A list of contexts.
-    workload : list
-        If not `None`, could be a list of numbers that specify the workload to be assigned
+    contexts : ArrayRef[AI::MXNet::Context]
+        A array ref of contexts.
+    workload : ArrayRef[Num]
+        If not undef, could be an array ref of numbers that specify the workload to be assigned
         to different context. Larger number indicate heavier workload.
-    data_shapes : list
-        Should be a list of (name, shape) tuples, for the shapes of data. Note the order is
+    data_shapes : ArrayRef[NameShape|AI::MXNet::DataDesc]
+        Should be a array ref of [name, shape] array refs, for the shapes of data. Note the order is
         important and should be the same as the order that the `DataIter` provide the data.
-    label_shapes : list
-        Should be a list of (name, shape) tuples, for the shapes of label. Note the order is
+    label_shapes : Maybe[ArrayRef[NameShape|AI::MXNet::DataDesc]]
+        Should be a array ref of [$name, $shape] array refs, for the shapes of label. Note the order is
         important and should be the same as the order that the `DataIter` provide the label.
-    param_names : 
-        A list of strings, indicating the names of parameters (e.g. weights, filters, etc.)
+    param_names : ArrayRef[Str]
+        A array ref of strings, indicating the names of parameters (e.g. weights, filters, etc.)
         in the computation graph.
-    for_training : bool
+    for_training : Bool
         Indicate whether the executors should be bind for training. When not doing training,
         the memory for gradients will not be allocated.
-    inputs_need_grad : bool
+    inputs_need_grad : Bool
         Indicate whether the gradients for the input data should be computed. This is currently
         not used. It will be useful for implementing composition of modules.
-    shared_group : DataParallelExecutorGroup
-        Default is `None`. This is used in bucketing. When not `None`, it should be a executor
+    shared_group : AI::MXNet::DataParallelExecutorGroup
+        Default is undef. This is used in bucketing. When not undef, it should be a executor
         group corresponding to a different bucket. In other words, it will correspond to a different
         symbol but with the same set of parameters (e.g. unrolled RNNs with different lengths).
         In this case, many memory will be shared.
-    input_types : hashref
-        Default is `None`. When not `None`, can be used to specify the data type for each
-        of the data/label inputs.
     logger : Logger
-        Default is `logging`.
-    fixed_param_names: list of str
-        Indicate parameters to be fixed during training. Parameters in this list will not allocate
+        Default is AI::MXNet::Logging->get_logger.
+    fixed_param_names: Maybe[ArrayRef[Str]]
+        Indicate parameters to be fixed during training. Parameters in this array ref will not allocate
         space for gradient, nor do gradient calculation.
-    grad_req : str, list of str, dict of str to str
+    grad_req : ArrayRef[GradReq]|HashRef[GradReq]|GradReq
         Requirement for gradient accumulation. Can be 'write', 'add', or 'null'
         (default to 'write').
-        Can be specified globally (str) or for each argument (list, dict).
+        Can be specified globally (str) or for each argument (array ref, hash ref).
+    state_names: Maybe[ArrayRef[Str]]
 =cut
 
 has 'symbol'            => (is => 'ro', isa => 'AI::MXNet::Symbol', required => 1);
@@ -182,9 +200,9 @@ has 'param_names'       => (is => 'ro', isa => 'ArrayRef[Str]', required => 1);
 has 'for_training'      => (is => 'ro', isa => 'Bool', required => 1);
 has 'inputs_need_grad'  => (is => 'ro', isa => 'Bool', default  => 0);
 has 'shared_group'      => (is => 'ro', isa => 'Maybe[AI::MXNet::DataParallelExecutorGroup]');
-has 'input_types'       => (is => 'ro', isa => 'HashRef[Dtype]');
 has 'logger'            => (is => 'ro', default => sub { AI::MXNet::Logging->get_logger });
 has 'fixed_param_names' => (is => 'rw', isa => 'Maybe[ArrayRef[Str]]');
+has 'state_names'       => (is => 'rw', isa => 'Maybe[ArrayRef[Str]]');
 has 'grad_req'          => (is => 'rw', isa => 'ArrayRef[GradReq]|HashRef[GradReq]|GradReq', default=>'write');
 has '_p'                => (is => 'rw', init_arg => undef);
 sub BUILD
@@ -193,9 +211,11 @@ sub BUILD
     my $p = AI::MXNet::DataParallelExecutorGroup::_private->new;
     $p->arg_names($self->symbol->list_arguments);
     $p->aux_names($self->symbol->list_auxiliary_states);
+    $p->execs([]);
     $self->_p($p);
     $self->grad_req('null') if not $self->for_training;
     $self->fixed_param_names([]) unless defined $self->fixed_param_names;
+    $self->state_names([]) unless defined $self->state_names;
     my $data_shapes = [];
     for my $d (@{ $self->data_shapes })
     {
@@ -269,11 +289,6 @@ sub BUILD
     {
         $self->_p->shared_data_arrays([map { +{} } 0..@{ $self->contexts }-1]);
     }
-    $self->_p->data_layouts($self->decide_slices($self->data_shapes));
-    if(defined $self->label_shapes)
-    {
-        $self->_p->label_layouts($self->decide_slices($self->label_shapes));
-    }
     $self->_p->output_layouts([
         map {
             AI::MXNet::DataDesc->get_batch_axis($self->symbol->slice($_)->attr('__layout__'))
@@ -284,11 +299,11 @@ sub BUILD
 
 =decide_slices
 
-        Decide the slices for each context according to the workload.
+Decide the slices for each context according to the workload.
 
-        Parameters
-        ----------
-        data_shapes : ArrayRef of AI::MXNet::DataDesc objects
+Parameters
+----------
+$data_shapes : ArrayRef[AI::MXNet::DataDesc]
 =cut
 
 method decide_slices(ArrayRef[AI::MXNet::DataDesc] $data_shapes)
@@ -316,32 +331,12 @@ method decide_slices(ArrayRef[AI::MXNet::DataDesc] $data_shapes)
     return $major_axis;
 }
 
-=method bind_exec
-
-        Bind executors on their respective devices.
-
-        Parameters
-        ----------
-        data_shapes  : ArrayRef of AI::MXNet::DataDesc objects
-        label_shapes : ArrayRef of AI::MXNet::DataDesc objects
-        shared_group : AI::MXNet::DataParallelExecutorGroup
-=cut
-
-method bind_exec(
-    ArrayRef[AI::MXNet::DataDesc] $data_shapes,
-    ArrayRef[AI::MXNet::DataDesc]|Undef $label_shapes,
-    AI::MXNet::DataParallelExecutorGroup|Undef $shared_group
-)
+# Collect internal arrays from executors.
+method _collect_arrays()
 {
-    $self->_p->execs([]);
-    for my $i (0..@{ $self->contexts }-1)
-    {
-        push @{ $self->_p->execs }, $self->_bind_ith_exec($i, $data_shapes, $label_shapes, $shared_group);
-    }
-
     # convenient data structures
     $self->_p->data_arrays([]);
-    for my $d (@{ $data_shapes })
+    for my $d (@{ $self->data_shapes })
     {
         my $name = $d->name;
         my @tmp;
@@ -351,10 +346,10 @@ method bind_exec(
         }
         push @{ $self->_p->data_arrays }, \@tmp;
     }
-    if(defined $label_shapes)
+    if(defined $self->label_shapes)
     {
         $self->_p->label_arrays([]);
-        for my $l (@{ $label_shapes })
+        for my $l (@{ $self->label_shapes })
         {
             my $name = $l->name;
             my @tmp;
@@ -380,6 +375,17 @@ method bind_exec(
             push @{ $self->_p->param_arrays }, \@tmp;
         }
     }
+    $self->_p->state_arrays([]);
+    for my $i (0..@{ $self->state_names }-1)
+    {
+        my $name = $self->state_names->[$i];
+        my @tmp;
+        for my $exec (@{ $self->_p->execs })
+        {
+            push @tmp, $exec->arg_dict->{$name};
+        }
+        push @{ $self->_p->state_arrays }, \@tmp;
+    }
     if($self->for_training)
     {
         $self->_p->grad_arrays([]);
@@ -397,7 +403,7 @@ method bind_exec(
             }
         }
     }
-    my %data_names = map { $_->name => 1 } @{ $data_shapes };
+    my %data_names = map { $_->name => 1 } @{ $self->data_shapes };
     if($self->inputs_need_grad)
     {
         $self->_p->input_grad_arrays([]);
@@ -427,16 +433,96 @@ method bind_exec(
     }
 }
 
+=method bind_exec
+
+Bind executors on their respective devices.
+
+Parameters
+----------
+$data_shapes  : ArrayRef[AI::MXNet::DataDesc]
+$label_shapes : Maybe[ArrayRef[AI::MXNet::DataDesc]]
+$shared_group : Maybe[AI::MXNet::DataParallelExecutorGroup]
+$reshape      : Bool
+=cut
+
+method bind_exec(
+    ArrayRef[AI::MXNet::DataDesc]               $data_shapes,
+    Maybe[ArrayRef[AI::MXNet::DataDesc]]        $label_shapes=,
+    Maybe[AI::MXNet::DataParallelExecutorGroup] $shared_group=,
+    Bool                                        $reshape=0
+)
+{
+    assert($reshape or not @{ $self->_p->execs });
+    $self->_p->batch_size(undef);
+
+    # calculate workload and bind executors
+    $self->_p->data_layouts($self->decide_slices($data_shapes));
+    # call it to make sure labels has the same batch size as data
+    if(defined $label_shapes)
+    {
+        $self->_p->label_layouts($self->decide_slices($label_shapes));
+    }
+
+    for my $i (0..@{ $self->contexts }-1)
+    {
+        my $data_shapes_i = $self->_sliced_shape($data_shapes, $i, $self->_p->data_layouts);
+        my $label_shapes_i = [];
+        if(defined $label_shapes)
+        {
+            $label_shapes_i = $self->_sliced_shape($label_shapes, $i, $self->_p->label_layouts);
+        }
+        if($reshape)
+        {
+            my %combined_hash = map { $_->name => $_->shape } (@{ $data_shapes_i }, @{ $label_shapes_i });
+            $self->_p->execs->[$i] = $self->_p->_default_execs->[$i]->reshape(
+                \%combined_hash,
+                allow_up_sizing => 1,
+            );
+        }
+        else
+        {
+            push @{ $self->_p->execs }, $self->_bind_ith_exec($i, $data_shapes_i, $label_shapes_i, $shared_group);
+        }
+    }
+    $self->data_shapes($data_shapes);
+    $self->label_shapes($label_shapes);
+    $self->_collect_arrays;
+}
+
+=head2 reshape
+
+Reshape executors.
+
+Parameters
+----------
+$data_shapes : ArrayRef[AI::MXNet::DataDesc]
+$label_shapes : Maybe[ArrayRef[AI::MXNet::DataDesc]]
+=cut
+
+
+method reshape(
+    ArrayRef[AI::MXNet::DataDesc]          $data_shapes,
+    Maybe[ArrayRef[AI::MXNet::DataDesc]]   $label_shapes=
+)
+{
+    return if($data_shapes eq $self->data_shapes and $label_shapes eq $self->label_shapes);
+    if (not defined $self->_p->_default_execs)
+    {
+        $self->_p->_default_execs([@{ $self->_p->execs }]);
+    }
+    $self->bind_exec($data_shapes, $label_shapes, undef, 1);
+}
+
 =head set_params
 
-        Assign, i.e. copy parameters to all the executors.
+Assign, i.e. copy parameters to all the executors.
 
-        Parameters
-        ----------
-        arg_params : dict
-            A dictionary of name to `NDArray` parameter mapping.
-        aux_params : dict
-            A dictionary of name to `NDArray` auxiliary variable mapping.
+Parameters
+----------
+$arg_params : HashRef[AI::MXNet::NDArray]
+    A dictionary of name to AI::MXNet::NDArray parameter mapping.
+$aux_params : HashRef[AI::MXNet::NDArray]
+    A dictionary of name to AI::MXNet::NDArray auxiliary variable mapping.
 =cut
 
 method set_params(HashRef[AI::MXNet::NDArray] $arg_params, HashRef[AI::MXNet::NDArray] $aux_params)
@@ -446,18 +532,18 @@ method set_params(HashRef[AI::MXNet::NDArray] $arg_params, HashRef[AI::MXNet::ND
 
 =head2 get_params
 
-        Copy data from each executor to `arg_params` and `aux_params`.
+Copy data from each executor to arg_params and aux_params.
 
-        Parameters
-        ----------
-        arg_params : Hash of NDArray
-            target parameter arrays
-        aux_params : Hash of NDArray
-            target aux arrays
+Parameters
+----------
+$arg_params : HashRef[AI::MXNet::NDArray]
+    target parameter arrays
+$aux_params : HashRef[AI::MXNet::NDArray]
+    target aux arrays
 
-        Notes
-        -----
-        - This function will inplace update the NDArrays in arg_params and aux_params.
+Notes
+-----
+- This function will inplace update the NDArrays in arg_params and aux_params.
 =cut
 
 method get_params(HashRef[AI::MXNet::NDArray] $arg_params, HashRef[AI::MXNet::NDArray] $aux_params)
@@ -475,19 +561,47 @@ method get_params(HashRef[AI::MXNet::NDArray] $arg_params, HashRef[AI::MXNet::ND
     }, $self->_p->aux_names, $self->_p->aux_arrays);
 }
 
+
+
+method get_states($merge_multi_context=1)
+{
+    assert((not $merge_multi_context), "merge_multi_context=True is not supported for get_states yet.");
+    return $self->_p->state_arrays;
+}
+
+method set_states($states, $value)
+{
+    if(defined $states)
+    {
+        assert((not defined $value), "Only one of states & value can be specified.");
+        AI::MXNet::Executor::Group::_load_general($states, $self->_p->state_arrays, [(0)x@{ $states }]);
+    }
+    else
+    {
+        assert((defined $value), "At least one of states & value must be specified.");
+        assert((not defined $states), "Only one of states & value can be specified.");
+        for my $d_dst (@{ $self->_p->state_arrays })
+        {
+            for my $dst (@{ $d_dst })
+            {
+                $dst .= $value;
+            }
+        }
+    }
+}
+
 =head2 forward
 
-        Split `data_batch` according to workload and run forward on each devices.
+Split the data_batch according to a workload and run forward on each devices.
 
-        Parameters
-        ----------
-        data_batch : AI::MXNet::DataBatch
-            Or could be any object implementing similar interface.
-        is_train : bool
-            The hint for the backend, indicating whether we are during training phase.
-            Default is `None`, then the value `self.for_training` will be used.
-        Returns
-        -------
+Parameters
+----------
+data_batch : AI::MXNet::DataBatch
+Or could be any object implementing similar interface.
+
+is_train : bool
+The hint for the backend, indicating whether we are during training phase.
+Default is undef, then the value $self->for_training will be used.
 =cut
 
 
@@ -527,21 +641,21 @@ method get_output_shapes()
 
 =head2 get_outputs
 
-        Get outputs of the previous forward computation.
+Gets outputs of the previous forward computation.
 
-        Parameters
-        ----------
-        merge_multi_context : bool
-            Default is `True`. In the case when data-parallelism is used, the outputs
-            will be collected from multiple devices. A `True` value indicate that we
-            should merge the collected results so that they look like from a single
-            executor.
+Parameters
+----------
+merge_multi_context : bool
+Default is 1. In the case when data-parallelism is used, the outputs
+will be collected from multiple devices. A 1 value indicates that we
+should merge the collected results so that they look like from a single
+executor.
 
-        Returns
-        -------
-        If `merge_multi_context` is `True`, it is like `[out1, out2]`. Otherwise, it
-        is like `[[out1_dev1, out1_dev2], [out2_dev1, out2_dev2]]`. All the output
-        elements are `NDArray`.
+Returns
+-------
+If merge_multi_context is 1, it is [$out1, $out2]. Otherwise, it
+is [[$out1_dev1, $out1_dev2], [$out2_dev1, $out2_dev2]]. All the output
+elements are `AI::MXNet::NDArray`.
 =cut
 
 method get_outputs(Bool $merge_multi_context=1)
@@ -565,21 +679,21 @@ method get_outputs(Bool $merge_multi_context=1)
 
 =head2  get_input_grads
 
-        Get the gradients with respect to the inputs of the module.
+Get the gradients with respect to the inputs of the module.
 
-        Parameters
-        ----------
-        merge_multi_context : bool
-            Default is `True`. In the case when data-parallelism is used, the outputs
-            will be collected from multiple devices. A `True` value indicate that we
-            should merge the collected results so that they look like from a single
-            executor.
+Parameters
+----------
+merge_multi_context : bool
+Default is 1. In the case when data-parallelism is used, the outputs
+will be collected from multiple devices. A 1 value indicates that we
+should merge the collected results so that they look like from a single
+executor.
 
-        Returns
-        -------
-        If `merge_multi_context` is `True`, it is like `[grad1, grad2]`. Otherwise, it
-        is like `[[grad1_dev1, grad1_dev2], [grad2_dev1, grad2_dev2]]`. All the output
-        elements are `NDArray`.
+Returns
+-------
+If merge_multi_context is 1, it is [$grad1, $grad2]. Otherwise, it
+is [[$grad1_dev1, $grad1_dev2], [$grad2_dev1, $grad2_dev2]]. All the output
+elements are AI::MXNet::NDArray.
 =cut
 
 method get_input_grads(Bool $merge_multi_context=1)
@@ -594,16 +708,16 @@ method get_input_grads(Bool $merge_multi_context=1)
 
 =head2 backward
 
-        Run backward on all devices. A backward should be called after
-        a call to the forward function. Backward cannot be called unless
-        `self.for_training` is `True`.
+Run backward on all devices. A backward should be called after
+a call to the forward function. Backward cannot be called unless
+$self->for_training is 1.
 
-        Parameters
-        ----------
-        out_grads : NDArray or list of NDArray, optional
-            Gradient on the outputs to be propagated back.
-            This parameter is only needed when bind is called
-            on outputs that are not a loss function.
+Parameters
+----------
+out_grads : NDArray or array ref of NDArray, optional
+Gradient on the outputs to be propagated back.
+This parameter is only needed when bind is called
+on outputs that are not a loss function.
 =cut
 
 method backward(Maybe[AI::MXNet::NDArray|ArrayRef[AI::MXNet::NDArray]] $out_grads=)
@@ -634,15 +748,17 @@ method backward(Maybe[AI::MXNet::NDArray|ArrayRef[AI::MXNet::NDArray]] $out_grad
 }
 
 =head2 update_metric
-        Accumulate the performance according to `eval_metric` on all devices.
 
-        Parameters
-        ----------
-        eval_metric : EvalMetric
-            The metric used for evaluation.
-        labels : list of NDArray
-            Typically comes from `label` of a `DataBatch`.
+Accumulate the performance according to eval_metric on all devices.
+
+Parameters
+----------
+eval_metric : AI::MXNet::EvalMetric
+    The metric used for evaluation.
+labels : array ref of NDArray
+    Typically comes from label of AI::MXNet::DataBatch.
 =cut
+
 method update_metric(AI::MXNet::EvalMetric $eval_metric, ArrayRef[AI::MXNet::NDArray] $labels)
 {
     zip(sub {
@@ -676,19 +792,13 @@ method update_metric(AI::MXNet::EvalMetric $eval_metric, ArrayRef[AI::MXNet::NDA
 # Internal utility function to bind the i-th executor.
 
 method _bind_ith_exec(
-    Int $i,
-    ArrayRef[AI::MXNet::DataDesc] $data_shapes,
-    ArrayRef[AI::MXNet::DataDesc]|Undef $label_shapes,
-    AI::MXNet::DataParallelExecutorGroup|Undef $shared_group
+    Int                                         $i,
+    ArrayRef[AI::MXNet::DataDesc]               $data_shapes,
+    Maybe[ArrayRef[AI::MXNet::DataDesc]]        $label_shapes,
+    Maybe[AI::MXNet::DataParallelExecutorGroup] $shared_group
 )
 {
-    $data_shapes = $self->_sliced_shape($data_shapes, $i, $self->_p->data_layouts);
-    if(defined $label_shapes)
-    {
-        $label_shapes = $self->_sliced_shape($label_shapes, $i, $self->_p->label_layouts);
-    }
-
-    my $shared_exec = $shared_group ? $shared_group->execs->[$i] : undef;
+    my $shared_exec = $shared_group ? $shared_group->_p->execs->[$i] : undef;
     my $context = $self->contexts->[$i];
     my $shared_data_arrays = $self->_p->shared_data_arrays->[$i];
     my %input_shapes = map { $_->name => $_->shape } @{ $data_shapes };
@@ -699,16 +809,7 @@ method _bind_ith_exec(
     my ($arg_shapes, undef, $aux_shapes) = $self->symbol->infer_shape(%input_shapes);
     confess("shape inference failed") unless defined $arg_shapes;
 
-    my %input_types;
-    if(not defined $self->input_types)
-    {
-        %input_types = map { $_ => 'float32' } keys %input_shapes;
-    }
-    else
-    {
-        %input_types = %{ $self->input_types }
-    }
-
+    my %input_types = map { $_->name => $_->dtype } @{ $data_shapes };
     my ($arg_types, undef, $aux_types) = $self->symbol->infer_type(%input_types);
     confess("type inference failed") unless defined $arg_types;
     my $arg_arrays = [];
@@ -793,7 +894,7 @@ method _bind_ith_exec(
                 my $arg_shape = $arg_shapes->[$j];
                 confess "shapes do not match (@$arg_arr_shape) != (@$arg_shape)"
                     unless "@$arg_arr_shape" eq "@$arg_shape";
-                my $arg_arr_type = $arg_arr->type;
+                my $arg_arr_type = $arg_arr->dtype;
                 my $arg_type = $arg_types->[$j];
                 confess "types do not match $arg_arr_type) != $arg_type"
                     unless $arg_arr_type eq $arg_type;
@@ -856,14 +957,14 @@ method _bind_ith_exec(
 
 =head2 _sliced_shape
 
-        Get the sliced shapes for the i-th executor.
+Get the sliced shapes for the i-th executor.
 
-        Parameters
-        ----------
-        shapes : list of (str, tuple)
-            The original (name, shape) pairs.
-        i : int
-            Which executor we are dealing with.
+Parameters
+----------
+shapes : array ref of (str, array ref)
+    The original (name, shape) pairs.
+i : int
+Which executor we are dealing with.
 =cut
 
 method _sliced_shape(ArrayRef[AI::MXNet::DataDesc] $shapes, Int $i, ArrayRef[Int] $major_axis)
@@ -876,18 +977,23 @@ method _sliced_shape(ArrayRef[AI::MXNet::DataDesc] $shapes, Int $i, ArrayRef[Int
         {
             $shape[$axis] = $self->_p->slices->[$i]->[1] - $self->_p->slices->[$i]->[0];
         }
-        push @sliced_shapes, AI::MXNet::DataDesc->new(name => $desc->name, shape => \@shape);
+        push @sliced_shapes, AI::MXNet::DataDesc->new(
+            name    => $desc->name,
+            shape   => \@shape,
+            dtype   => $desc->dtype,
+            layout  => $desc->layout
+        );
     }, $shapes, $major_axis);
     return \@sliced_shapes;
 }
 
 =head2 install_monitor
 
-        Install monitor on all executors
+Install monitor on all executors
 
-        Parameters
-        ----------
-        mon : AI::MXNet::Monitor
+Parameters
+----------
+$mon : AI::MXNet::Monitor
 =cut
 
 method install_monitor(AI::MXNet::Monitor $mon)

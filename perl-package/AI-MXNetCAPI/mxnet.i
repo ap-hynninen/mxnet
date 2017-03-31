@@ -4,37 +4,6 @@
 %include mxnet_typemaps.i
 %inline %{
 #include <c_api.h>
-static int _p_MXNDArray_inited = 0;
-static int _p_MXFunction_inited = 0;
-static int _p_MXAtomicSymbolCreator_inited = 0;
-static int _p_MXSymbol_inited = 0;
-static int _p_MXAtomicSymbol_inited = 0;
-static int _p_MXExecutor_inited = 0;
-static int _p_MXDataIterCreator_inited = 0;
-static int _p_MXDataIter_inited = 0;
-static int _p_MXKVStore_inited = 0;
-static int _p_MXRecordIO_inited = 0;
-static int _p_MXRtc_inited = 0;
-static char _p_MXNDArray_module_name[50];
-static char _p_MXFunction_module_name[50];
-static char _p_MXAtomicSymbolCreator_module_name[50];
-static char _p_MXSymbol_module_name[50];
-static char _p_MXExecutor_module_name[50];
-static char _p_MXDataIterCreator_module_name[50];
-static char _p_MXDataIter_module_name[50];
-static char _p_MXKVStore_module_name[50];
-static char _p_MXRecordIO_module_name[50];
-static char _p_MXRtc_module_name[50];
-void assert_class_name(int *inited, const char* mangled_name, const char* correct_name, char* static_buf)
-{
-  if(!*inited)
-  {
-    strcpy(static_buf, correct_name); 
-    swig_type_info *info = SWIG_TypeQuery(mangled_name);
-    info->clientdata = static_buf;
-    *inited = 1;
-  }
-}
 
 // Taken as is from http://cpansearch.perl.org/src/COLEMINOR/Games-EternalLands-Binary-Float16-0.01/Float16.xs
 /* This method is faster than the OpenEXR implementation (very often
@@ -102,7 +71,6 @@ static void KVStore_callback(int index, NDArrayHandle recv, NDArrayHandle local,
 {
     {
         dSP;
-        assert_class_name(&_p_MXNDArray_inited, "_p_MXNDArray", "NDArrayHandle", _p_MXNDArray_module_name);
         PUSHMARK(SP);
         XPUSHs(sv_2mortal(newSViv(index)));
         XPUSHs(SWIG_NewPointerObj(SWIG_as_voidptr(recv), SWIGTYPE_p_MXNDArray, 0));
@@ -129,7 +97,6 @@ static void ExecutorMonitor_callback(const char* name, NDArrayHandle handle, voi
 {
     {
         dSP;
-        assert_class_name(&_p_MXNDArray_inited, "_p_MXNDArray", "NDArrayHandle", _p_MXNDArray_module_name);
         STRLEN len;
         PUSHMARK(SP);
         XPUSHs(sv_2mortal(newSVpv(name, len)));
@@ -140,6 +107,21 @@ static void ExecutorMonitor_callback(const char* name, NDArrayHandle handle, voi
 }
 
 %} 
+
+%init %{
+    /* These SWIG_TypeClientData() calls might break in the future, but
+     * %rename should work on these types before that happens. */
+    SWIG_TypeClientData(SWIGTYPE_p_MXNDArray, (void *)"NDArrayHandle");
+    SWIG_TypeClientData(SWIGTYPE_p_MXFunction, (void *)"FunctionHandle");
+    SWIG_TypeClientData(SWIGTYPE_p_MXAtomicSymbolCreator, (void *)"AtomicSymbolCreator");
+    SWIG_TypeClientData(SWIGTYPE_p_MXSymbol, (void *)"SymbolHandle");
+    SWIG_TypeClientData(SWIGTYPE_p_MXExecutor, (void *)"ExecutorHandle");
+    SWIG_TypeClientData(SWIGTYPE_p_MXDataIterCreator, (void *)"DataIterCreator");
+    SWIG_TypeClientData(SWIGTYPE_p_MXDataIter, (void *)"DataIterHandle");
+    SWIG_TypeClientData(SWIGTYPE_p_MXKVStore, (void *)"KVStoreHandle");
+    SWIG_TypeClientData(SWIGTYPE_p_MXRecordIO, (void *)"RecordIOHandle");
+    SWIG_TypeClientData(SWIGTYPE_p_MXRtc, (void *)"RtcHandle");
+%}
 
 /*! \brief manually define unsigned int */
 typedef unsigned int mx_uint;
@@ -205,44 +187,6 @@ struct NDArrayOpInfo {
   void* p_declare_backward_dependency;
 };
 
-struct CustomOpInfo {
-  bool (*forward)(int /*size*/, void** /*ptrs*/, int* /*tags*/,
-                  const int* /*reqs*/, const bool /*is_train*/, void* /*state*/);
-  bool (*backward)(int /*size*/, void** /*ptrs*/, int* /*tags*/,
-                   const int* /*reqs*/, const bool /*is_train*/, void* /*state*/);
-  bool (*del)(void* /*state*/);
-  // all functions also pass a payload void* pointer
-  void* p_forward;
-  void* p_backward;
-  void* p_del;
-};
-
-struct CustomOpPropInfo {
-  bool (*list_arguments)(char*** /*args*/, void* /*state*/);
-  bool (*list_outputs)(char*** /*outputs*/, void* /*state*/);
-  bool (*infer_shape)(int /*num_input*/, int* /*ndims*/, unsigned** /*shapes*/,
-                      void* /*state*/);
-  bool (*declare_backward_dependency)(const int* /*out_grad*/, const int* /*in_data*/,
-                                      const int* /*out_data*/, int* /*num_deps*/,
-                                      int** /*rdeps*/, void* /*state*/);
-  bool (*create_operator)(const char* /*ctx*/, int /*num_inputs*/, unsigned** /*shapes*/,
-                          int* /*ndims*/, int* /*dtypes*/,
-                          CustomOpInfo* /*ret*/, void* /*state*/);
-  bool (*list_auxiliary_states)(char*** /*aux*/, void* /*state*/);
-  bool (*del)(void* /*state*/);
-  // all functions also pass a payload void* pointer
-  void* p_list_arguments;
-  void* p_list_outputs;
-  void* p_infer_shape;
-  void* p_declare_backward_dependency;
-  void* p_create_operator;
-  void* p_list_auxiliary_states;
-  void* p_del;
-};
-
-typedef bool (*CustomOpPropCreator)(const char* /*op_type*/, const int /*num_kwargs*/,
-                                    const char** /*keys*/, const char** /*values*/,
-                                    CustomOpPropInfo* /*ret*/);
 /*!
  * \brief return str message of the last error
  *  all function in this file will return 0 when success
@@ -288,6 +232,9 @@ int MXSetProfilerConfig(int mode, const char* filename);
  * \return 0 when success, -1 when failure happens.
  */
 int MXSetProfilerState(int state);
+
+/*! \brief Save profile and stop profiler */
+int MXDumpProfile();
 
 //-------------------------------------
 // Part 1: NDArray creation and deletion
@@ -839,6 +786,14 @@ int MXSymbolListOutputs(SymbolHandle symbol,
  */
 int MXSymbolGetInternals(SymbolHandle symbol,
                                    SymbolHandle *out);
+/*!
+ * \brief Get a symbol that contains only direct children.
+ * \param symbol The symbol
+ * \param out The output symbol whose outputs are the direct children.
+ * \return 0 when success, -1 when failure happens
+ */
+int MXSymbolGetChildren(SymbolHandle symbol,
+                                  SymbolHandle *out);
 /*!
  * \brief Get index-th outputs of the symbol.
  * \param symbol The symbol

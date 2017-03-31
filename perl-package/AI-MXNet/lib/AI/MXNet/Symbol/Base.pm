@@ -8,6 +8,16 @@ use AI::MXNet::Symbol::NameManager;
 use Mouse;
 use AI::MXNet::Function::Parameters;
 
+=head1 NAME
+
+AI::MXNet::Symbol::Base
+=cut
+
+=head1 DESCRIPTION
+
+A convenience class that loads all C++m symbol related functions at runtime.
+=cut
+
 my %function_meta;
 method function_meta($code)
 {
@@ -19,34 +29,15 @@ method function_meta_hash()
     return \%function_meta;
 }
 
-=head2 _compose
-
-        Compose symbol on inputs.
-
-        This call mutates the current symbol.
-
-        Parameters
-        ----------
-        args:
-            provide positional arguments
-
-        kwargs:
-            provide keyword arguments
-
-        Returns
-        -------
-        the resulting symbol
-=cut
-
 sub _compose
 {
     my $self = shift;
     my (@args, %kwargs);
-    if(@_ and ref $_[-1] eq 'HASH')
+    while(ref $_[0])
     {
-        %kwargs = %{ pop(@_) };
+        push @args, shift(@_);
     }
-    @args = @_;
+    %kwargs = @_;
     my $name = delete $kwargs{'name'};
     if(@args and %kwargs)
     {
@@ -90,25 +81,16 @@ func _make_atomic_symbol_function($handle, $name)
                             $key_var_num_args,
                             $ret_type
     );
-=head2
-
-        Activation Operator of Neural Net.
-        The parameters listed below can be passed in as keyword arguments.
-
-        Parameters
-        ----------
-        name : string, required.
-            Name of the resulting symbol.
-
-        Returns
-        -------
-        symbol: Symbol
-            the resulting symbol
-=cut
     my $creator = sub {
         my $class = shift;
         my (@args, %kwargs);
-        if(@_ and ref $_[-1] eq 'HASH')
+        if(
+            @_
+                and
+            ref $_[-1] eq 'HASH'
+                and
+            not (@_ >= 2 and not blessed $_[-2] and $_[-2] eq 'attr')
+        )
         {
             %kwargs = %{ pop(@_) };
             @args = @_;
@@ -136,7 +118,7 @@ func _make_atomic_symbol_function($handle, $name)
         }
         for my $key (keys %kwargs)
         {
-            $kwargs{ $key } = "(" .join(",", @{ $kwargs{ $key } }) .")" 
+            $kwargs{ $key } = "(" .join(", ", @{ $kwargs{ $key } }) .")"
                 if ref $kwargs{ $key } eq 'ARRAY';
         }
         while(my ($k, $v) = each %kwargs)
@@ -158,11 +140,10 @@ func _make_atomic_symbol_function($handle, $name)
                 $params
             )
         );
-
         my $s = $class->new(handle => $sym_handle);
         my $hint = lc($func_name);
         $name = AI::MXNet::Symbol::NameManager->current->get($name, $hint);
-        $s->_compose(@args, { name => $name, %$symbol_kwargs });
+        $s->_compose(@args, name => $name, %$symbol_kwargs);
         return $s;
     };
     $function_meta{ $creator }{__name__} = $func_name;

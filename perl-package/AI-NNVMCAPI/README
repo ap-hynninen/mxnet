@@ -1,8 +1,7 @@
-AI-NNVMCAPI version 0.02
+AI-NNVMCAPI version 0.95
 =====================
 
 Swig interface to MXNet c api.
-This is alpha release and WIP.
 
 INSTALLATION
 
